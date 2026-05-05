@@ -1,0 +1,16 @@
+{
+  "name": "n9server",
+  "version": "1.0.0",
+  "description": "Self-hosted server for the N9 ADAS/DMS dashcam.   Speaks **JT/T 808-2019** (signalling) + **JT/T 1078-2016** (video), outputs **HLS**.",
+  "main": "doc.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "docx": "^9.6.1"
+  }
+}

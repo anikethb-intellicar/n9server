@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.env
+.venv
+venv/
+
+# HLS output (generated at runtime)
+static/hls/
+
+# Node (for docx generation script only)
+node_modules/
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# VS Code
+.vscode/
+
+# Keys / secrets
+*.pem
+*.ppk
+*.key
+
+# Logs
+*.log
+
+# Temp
+*.tmp
+*.bak

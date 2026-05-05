@@ -1,0 +1,6 @@
+github.com/fabrikiot/goutils/beutils v0.0.0-20241108190931-84945e9a9144 h1:jhtZz4tvfUW/lh+YZf6VYOr+FF/9B1JCn5PIuZpAqJA=
+github.com/fabrikiot/goutils/beutils v0.0.0-20241108190931-84945e9a9144/go.mod h1:P6R7l0K8u8dgTuauIh4/WJqhdmlF1TCRRYqRjFsR7BY=
+github.com/fabrikiot/goutils/leutils v0.0.0-20241108190931-84945e9a9144 h1:yteamijpprNm0HLzPBXeKHvzGXvSlYowBJnrXobtr/U=
+github.com/fabrikiot/goutils/leutils v0.0.0-20241108190931-84945e9a9144/go.mod h1:qw2ksA4jz3M7RXagM5fC+gPkRnXK/rsMzm6m6ORg2DI=
+golang.org/x/text v0.28.0 h1:rhazDwis8INMIwQ4tpjLDzUhx6RlXqZNPEM0huQojng=
+golang.org/x/text v0.28.0/go.mod h1:U8nCwOR8jO/marOQ0QbDiOngZVEBB7MAiitBuMjXiNU=
