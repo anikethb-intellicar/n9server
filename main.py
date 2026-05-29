@@ -87,9 +87,8 @@ class JT808Connection:
         """Write with timeout + raw hex TX logging."""
         log.debug("TX %d bytes to %s | hex: %s", len(data), self.peer, data.hex())
         try:
-            async with asyncio.timeout(WRITE_TIMEOUT):
-                self.writer.write(data)
-                await self.writer.drain()
+            self.writer.write(data)
+            await asyncio.wait_for(self.writer.drain(), timeout=WRITE_TIMEOUT)
         except (asyncio.TimeoutError, ConnectionResetError, BrokenPipeError) as e:
             log.warning("TX failed to %s: %s", self.peer, e)
 
@@ -103,8 +102,7 @@ class JT808Connection:
         try:
             while True:
                 try:
-                    async with asyncio.timeout(READ_TIMEOUT):
-                        chunk = await self.reader.read(4096)
+                    chunk = await asyncio.wait_for(self.reader.read(4096), timeout=READ_TIMEOUT)
                 except asyncio.TimeoutError:
                     log.warning("Read timeout for %s — closing", self.peer)
                     break
@@ -397,8 +395,7 @@ class JT1078Connection:
         try:
             while True:
                 try:
-                    async with asyncio.timeout(READ_TIMEOUT):
-                        data = await self.reader.read(65536)
+                    data = await asyncio.wait_for(self.reader.read(65536), timeout=READ_TIMEOUT)
                 except asyncio.TimeoutError:
                     log.warning("JT1078 read timeout for %s", self.peer)
                     break
@@ -496,20 +493,16 @@ async def http_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
     """Minimal HTTP/1.0 server — HLS files + status + player."""
     try:
         try:
-            async with asyncio.timeout(10):
-                request_line = await reader.readline()
+            request_line = (await asyncio.wait_for(reader.readline(), timeout=10)).decode(errors="replace").strip()
         except asyncio.TimeoutError:
             return
-
-        request_line = request_line.decode(errors="replace").strip()
         if not request_line:
             return
 
         # Drain headers
         while True:
             try:
-                async with asyncio.timeout(5):
-                    line = await reader.readline()
+                line = await asyncio.wait_for(reader.readline(), timeout=5)
             except asyncio.TimeoutError:
                 break
             if line in (b"\r\n", b"\n", b""):
@@ -520,7 +513,7 @@ async def http_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             return
         path = parts[1].split("?")[0]
 
-        static_dir = Path(__file__).parent.parent / "static"
+        static_dir = Path(__file__).parent / "static"
 
         def respond(status: str, ct: str, body: bytes):
             hdr = (
@@ -555,8 +548,7 @@ async def http_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             respond("404 Not Found", "text/plain", b"Not found")
 
         try:
-            async with asyncio.timeout(WRITE_TIMEOUT):
-                await writer.drain()
+            await asyncio.wait_for(writer.drain(), timeout=WRITE_TIMEOUT)
         except asyncio.TimeoutError:
             pass
 
