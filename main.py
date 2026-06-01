@@ -55,18 +55,28 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 # ── Timeouts (seconds) ───────────────────────────────────────────────────────
-READ_TIMEOUT  = 300   # how long to wait for next data from device
+READ_TIMEOUT  = 30    # JT1078: re-request faster when camera pauses (was 300s)
 WRITE_TIMEOUT = 10    # how long a send is allowed to take
 
 # ── Shared state ─────────────────────────────────────────────────────────────
-stream_mgr  = StreamManager()
 auth_store  = AuthCodeStore()
 
-# phone -> {phone, registered, authed, last_seen, location, peer, reg_info}
+# phone -> {phone, registered, authed, online, last_seen, location, peer, reg_info}
 devices: dict[str, dict] = {}
 
-# Active authenticated JT808 connections (for cross-component signaling)
+# Per-device stream managers: phone -> StreamManager
+device_streams: dict[str, StreamManager] = {}
+
+def get_device_streams(phone: str) -> StreamManager:
+    if phone not in device_streams:
+        device_streams[phone] = StreamManager()
+    return device_streams[phone]
+
+# Active authenticated JT808 connections
 active_jt808: dict[str, object] = {}
+
+# Legacy alias (used in JT1078Connection)
+stream_mgr = None  # replaced by per-device lookup
 
 # JT1078 channel assignment: each new connection gets the next available channel (1-4)
 _jt1078_channel_counter = 0
@@ -137,11 +147,14 @@ class JT808Connection:
             phone = self.phone or self.peer
             log.info("JT808 disconnect: %s", phone)
             if self.phone:
-                dev = devices.get(self.phone, {})
-                dev["online"] = False
-                dev["authed"] = False
+                # Remove device completely on disconnect
+                devices.pop(self.phone, None)
                 auth_store.revoke(self.phone)
                 active_jt808.pop(self.phone, None)
+                # Stop and clean up streams for this device
+                mgr = device_streams.pop(self.phone, None)
+                if mgr:
+                    asyncio.ensure_future(mgr.stop_all())
 
     async def _process_buf(self):
         while True:
@@ -477,8 +490,18 @@ class JT1078Connection:
         global _jt1078_channel_counter
         _jt1078_channel_counter += 1
         my_channel = ((_jt1078_channel_counter - 1) % _NUM_CAMERAS) + 1
-        log.info("JT1078 connect from %s → assigned to channel %d", self.peer, my_channel)
-        await stream_mgr.soft_reset(my_channel)  # keep FFmpeg running for seamless reconnect
+
+        # Find which device (phone) this JT1078 connection belongs to
+        cam_ip = self.peer.split(":")[0]
+        my_phone = None
+        for phone, info in devices.items():
+            if info.get("peer", "").startswith(cam_ip):
+                my_phone = phone
+                break
+
+        mgr = get_device_streams(my_phone) if my_phone else get_device_streams("unknown")
+        log.info("JT1078 connect from %s → device=%s ch%d", self.peer, my_phone, my_channel)
+        await mgr.soft_reset(my_channel)
         try:
             while True:
                 try:
@@ -495,28 +518,26 @@ class JT1078Connection:
 
                 self._buf.feed(data)
                 for pkt in self._buf.packets():
-                    await self._handle_packet(pkt, my_channel)
+                    await self._handle_packet(pkt, my_channel, mgr)
 
         except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
             pass
         finally:
-            log.info("JT1078 disconnect: ch%d %s", my_channel, self.peer)
-            # Re-request immediately (no wait) — FFmpeg keeps running so no startup gap
+            log.info("JT1078 disconnect: ch%d device=%s", my_channel, my_phone)
             for conn in list(active_jt808.values()):
                 if conn._is_authed():
                     asyncio.ensure_future(conn._request_stream(channel=my_channel))
                     break
 
-    async def _handle_packet(self, pkt, channel: int = 1):
+    async def _handle_packet(self, pkt, channel: int = 1, mgr=None):
         if not pkt.payload:
             return
-        # Accept any packet with a video codec (H264/H265) regardless of data_type field
-        # The camera sometimes marks video packets with non-standard data_type values
         if pkt.codec not in ('H264', 'H265', 'PT98', 'PT99'):
-            # Only skip obvious non-video like audio codecs
             if pkt.is_audio:
                 return
-        await stream_mgr.write_frame(channel, pkt.payload, codec=pkt.codec)
+        if mgr is None:
+            return
+        await mgr.write_frame(channel, pkt.payload, codec=pkt.codec)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -531,40 +552,120 @@ PLAYER_HTML = """\
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>N9 Dashcam Live</title>
 <style>
-  body { font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 0; padding: 20px; }
-  h1   { font-size: 1.2rem; font-weight: 500; margin: 0 0 1rem; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 16px; }
-  .card { background: #1c1c1c; border-radius: 8px; padding: 12px; }
-  .card h2 { font-size: 0.85rem; font-weight: 500; color: #888; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .05em; }
-  video { width: 100%; border-radius: 4px; background: #000; }
-  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #555; margin-right: 6px; }
-  .dot.live { background: #22c55e; }
-  pre { font-size: .75rem; color: #888; overflow: auto; max-height: 200px; background: #0a0a0a; padding: 8px; border-radius: 4px; }
+  *{box-sizing:border-box}
+  body{font-family:system-ui,sans-serif;background:#0f0f0f;color:#eee;margin:0;display:flex;height:100vh;overflow:hidden}
+  /* Left panel */
+  #sidebar{width:220px;min-width:180px;background:#1a1a1a;border-right:1px solid #2a2a2a;display:flex;flex-direction:column;overflow:hidden}
+  #sidebar h2{font-size:.75rem;font-weight:600;color:#666;text-transform:uppercase;letter-spacing:.08em;padding:16px 16px 8px}
+  #device-list{flex:1;overflow-y:auto}
+  .device-item{padding:12px 16px;cursor:pointer;border-bottom:1px solid #222;transition:background .15s}
+  .device-item:hover{background:#252525}
+  .device-item.active{background:#1e3a5f;border-left:3px solid #3b82f6}
+  .device-item .did{font-size:.85rem;font-weight:500;color:#ddd}
+  .device-item .dmeta{font-size:.72rem;color:#666;margin-top:2px}
+  .online-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#22c55e;margin-right:6px}
+  /* Main area */
+  #main{flex:1;display:flex;flex-direction:column;overflow:hidden;padding:16px;gap:12px}
+  #main-header{display:flex;align-items:center;gap:12px}
+  #main-header h1{font-size:1rem;font-weight:500;margin:0;color:#ccc}
+  #selected-device{font-size:.8rem;color:#3b82f6;font-weight:500}
+  .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;flex:1;overflow:hidden}
+  .card{background:#1c1c1c;border-radius:8px;overflow:hidden;display:flex;flex-direction:column}
+  .card-hdr{display:flex;align-items:center;padding:8px 10px;background:#222;font-size:.75rem;font-weight:500;color:#888;text-transform:uppercase;letter-spacing:.05em}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#444;margin-right:6px}
+  .dot.live{background:#22c55e}
+  .card img{width:100%;flex:1;object-fit:cover;background:#000;display:block}
+  #no-device{color:#555;font-size:.9rem;text-align:center;padding:60px 20px}
 </style>
 </head>
 <body>
-<h1>N9 Dashcam — Live View</h1>
-<div class="grid" id="grid"></div>
-<div class="card" style="margin-top:16px"><h2>Device status</h2><pre id="status">loading...</pre></div>
+<div id="sidebar">
+  <h2>Devices</h2>
+  <div id="device-list"><div style="padding:16px;font-size:.8rem;color:#555">No devices connected</div></div>
+</div>
+<div id="main">
+  <div id="main-header">
+    <h1>N9 Dashcam — Live View</h1>
+    <span id="selected-device"></span>
+  </div>
+  <div class="grid" id="grid"><div id="no-device">Select a device from the left panel</div></div>
+</div>
 <script>
-function createPlayer(ch) {
-  const card = document.createElement('div');
-  card.className = 'card';
-  // Use <img> for MJPEG — browser handles it natively, truly real-time, no buffering
-  card.innerHTML = `<h2><span class="dot" id="dot${ch}"></span>Channel ${ch}</h2>
-    <img id="v${ch}" src="/mjpeg/${ch}" style="width:100%;border-radius:4px;background:#000"
-         onerror="setTimeout(()=>{ this.src='/mjpeg/${ch}?t='+Date.now(); },2000)">`;
-  document.getElementById('grid').appendChild(card);
+let currentPhone = null;
+let knownDevices = {};
+
+function deviceLabel(phone, info) {
+  const plate = (info.reg_info?.license_plate || '').replace(/\\u0000/g,'').replace(/[^\\x20-\\x7E]/g,'').trim();
+  const model = (info.reg_info?.terminal_model || '').trim();
+  return plate || model || phone.slice(-8);
 }
-[1,2,3,4].forEach(createPlayer);
+
+function showDevice(phone, info) {
+  currentPhone = phone;
+  document.getElementById('selected-device').textContent = deviceLabel(phone, info);
+  document.querySelectorAll('.device-item').forEach(el => el.classList.toggle('active', el.dataset.phone === phone));
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+  document.getElementById('no-device')?.remove();
+  for (let ch = 1; ch <= 4; ch++) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    const streams = info.streams || {};
+    const live = Object.entries(streams).find(([k,v]) => parseInt(k)===ch && v.live);
+    card.innerHTML = `<div class="card-hdr"><span class="dot${live?' live':''}" id="dot${phone}-${ch}"></span>Channel ${ch}</div>
+      <img src="/mjpeg/${encodeURIComponent(phone)}/${ch}" style="height:100%;object-fit:cover;background:#000"
+           onerror="setTimeout(()=>{ this.src='/mjpeg/${encodeURIComponent(phone)}/${ch}?t='+Date.now(); },2000)">`;
+    grid.appendChild(card);
+  }
+}
+
+function renderSidebar(devicesData) {
+  const list = document.getElementById('device-list');
+  const phones = Object.keys(devicesData);
+  if (!phones.length) {
+    list.innerHTML = '<div style="padding:16px;font-size:.8rem;color:#555">No devices connected</div>';
+    currentPhone = null;
+    document.getElementById('grid').innerHTML = '<div id="no-device" style="color:#555;font-size:.9rem;text-align:center;padding:60px 20px">No devices connected</div>';
+    document.getElementById('selected-device').textContent = '';
+    return;
+  }
+  // Add new devices, remove gone ones
+  phones.forEach(phone => {
+    if (!document.querySelector(`[data-phone="${phone}"]`)) {
+      const item = document.createElement('div');
+      item.className = 'device-item';
+      item.dataset.phone = phone;
+      const info = devicesData[phone];
+      item.innerHTML = `<div class="did"><span class="online-dot"></span>${deviceLabel(phone,info)}</div>
+        <div class="dmeta">ID: ${phone.slice(-8)}</div>`;
+      item.onclick = () => showDevice(phone, devicesData[phone]);
+      list.appendChild(item);
+    }
+  });
+  list.querySelectorAll('.device-item').forEach(el => {
+    if (!devicesData[el.dataset.phone]) el.remove();
+  });
+  // Auto-select first device if none selected
+  if (!currentPhone || !devicesData[currentPhone]) {
+    showDevice(phones[0], devicesData[phones[0]]);
+  }
+}
+
+function updateDots(devicesData) {
+  if (!currentPhone || !devicesData[currentPhone]) return;
+  const streams = devicesData[currentPhone].streams || {};
+  for (let ch = 1; ch <= 4; ch++) {
+    const dot = document.getElementById(`dot${currentPhone}-${ch}`);
+    const live = Object.entries(streams).some(([k,v]) => parseInt(k)===ch && v.live);
+    if (dot) dot.className = 'dot' + (live?' live':'');
+  }
+}
+
 async function poll() {
   try {
     const d = await (await fetch('/status')).json();
-    document.getElementById('status').textContent = JSON.stringify(d, null, 2);
-    for (const [ch, info] of Object.entries(d.streams || {})) {
-      const dot = document.getElementById('dot'+ch);
-      if (dot) dot.className = 'dot' + (info.live ? ' live' : '');
-    }
+    renderSidebar(d.devices || {});
+    updateDots(d.devices || {});
   } catch(e) {}
   setTimeout(poll, 3000);
 }
@@ -603,13 +704,16 @@ async def http_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             return
         path = parts[1].split("?")[0]
 
-        # MJPEG live stream — one HTTP connection per channel, frames pushed in real-time
+        # MJPEG live stream — /mjpeg/<phone>/<channel>
         if path.startswith("/mjpeg/"):
+            parts_p = path.strip("/").split("/")
             try:
-                ch = int(path.split("/")[-1].split("?")[0])
+                phone = parts_p[1]
+                ch = int(parts_p[2].split("?")[0])
             except (ValueError, IndexError):
                 writer.close()
                 return
+            mgr = get_device_streams(phone)
             # Send MJPEG headers
             writer.write(
                 b"HTTP/1.0 200 OK\r\n"
@@ -619,16 +723,15 @@ async def http_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                 b"\r\n"
             )
             await writer.drain()
-            stream_mgr.add_mjpeg_client(ch, writer)
+            mgr.add_mjpeg_client(ch, writer)
             try:
-                # Keep connection alive — client disconnects by closing browser/tab
                 while True:
                     await asyncio.sleep(30)
                     # Send a keepalive comment (MJPEG doesn't need explicit keepalive, but doesn't hurt)
             except Exception:
                 pass
             finally:
-                stream_mgr.remove_mjpeg_client(ch, writer)
+                mgr.remove_mjpeg_client(ch, writer)
                 try:
                     writer.close()
                 except Exception:
@@ -652,8 +755,13 @@ async def http_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
         elif path == "/status":
             payload = json.dumps({
-                "devices": devices,
-                "streams": stream_mgr.status,
+                "devices": {
+                    phone: {
+                        **info,
+                        "streams": get_device_streams(phone).status,
+                    }
+                    for phone, info in devices.items()
+                }
             }, indent=2, default=str).encode()
             respond("200 OK", "application/json", payload)
 
