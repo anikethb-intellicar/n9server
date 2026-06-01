@@ -28,6 +28,8 @@ import time
 import socket
 from pathlib import Path
 
+from hls import StreamManager
+
 from jt808 import (
     parse_frame,
     build_general_resp, build_register_resp, build_av_request, build_av_close,
@@ -436,14 +438,7 @@ class JT808Connection:
         await self._send(resp)
 
     async def _request_stream(self, channel: int = 1):
-        """Send 0x9102 close then 0x9101 open — ensures single JT1078 connection."""
-        close_cmd = build_av_close(
-            phone=self.phone, serial=self._next_serial(),
-            channel=channel, close_type=0, is_2019=self._is_2019,
-        )
-        await self._send(close_cmd)
-        await asyncio.sleep(0.5)
-
+        """Send 0x9101 to open JT1078 stream for the given channel."""
         log.info("Requesting AV stream ch%d from %s → %s:%d",
                  channel, self.phone, self.server_ip, self.jt1078_port)
         cmd = build_av_request(
@@ -480,11 +475,10 @@ class JT1078Connection:
 
     async def run(self):
         global _jt1078_channel_counter
-        # Assign this connection to the next camera channel (1-4, cycling)
         _jt1078_channel_counter += 1
         my_channel = ((_jt1078_channel_counter - 1) % _NUM_CAMERAS) + 1
         log.info("JT1078 connect from %s → assigned to channel %d", self.peer, my_channel)
-        await stream_mgr.reset(my_channel)
+        await stream_mgr.soft_reset(my_channel)  # keep FFmpeg running for seamless reconnect
         try:
             while True:
                 try:
@@ -507,11 +501,9 @@ class JT1078Connection:
             pass
         finally:
             log.info("JT1078 disconnect: ch%d %s", my_channel, self.peer)
-            # Re-request the stream for this channel
-            await asyncio.sleep(1)
+            # Re-request immediately (no wait) — FFmpeg keeps running so no startup gap
             for conn in list(active_jt808.values()):
                 if conn._is_authed():
-                    log.info("JT1078 ch%d ended — re-requesting", my_channel)
                     asyncio.ensure_future(conn._request_stream(channel=my_channel))
                     break
 
@@ -549,40 +541,20 @@ PLAYER_HTML = """\
   .dot.live { background: #22c55e; }
   pre { font-size: .75rem; color: #888; overflow: auto; max-height: 200px; background: #0a0a0a; padding: 8px; border-radius: 4px; }
 </style>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js"></script>
 </head>
 <body>
 <h1>N9 Dashcam — Live View</h1>
 <div class="grid" id="grid"></div>
 <div class="card" style="margin-top:16px"><h2>Device status</h2><pre id="status">loading...</pre></div>
 <script>
-const BASE = window.location.origin;
 function createPlayer(ch) {
   const card = document.createElement('div');
   card.className = 'card';
+  // Use <img> for MJPEG — browser handles it natively, truly real-time, no buffering
   card.innerHTML = `<h2><span class="dot" id="dot${ch}"></span>Channel ${ch}</h2>
-    <video id="v${ch}" controls autoplay muted playsinline></video>`;
+    <img id="v${ch}" src="/mjpeg/${ch}" style="width:100%;border-radius:4px;background:#000"
+         onerror="setTimeout(()=>{ this.src='/mjpeg/${ch}?t='+Date.now(); },2000)">`;
   document.getElementById('grid').appendChild(card);
-  const url = `${BASE}/hls/${ch}/index.m3u8`;
-  const v = document.getElementById(`v${ch}`);
-  if (Hls.isSupported()) {
-    const hls = new Hls({
-      lowLatencyMode: true,
-      liveSyncDurationCount: 2,       // stay 2 segments behind live edge
-      liveMaxLatencyDurationCount: 5, // allow up to 5 segments behind before seeking
-      startPosition: -1,              // start at live edge, not beginning
-      maxBufferLength: 10,
-      maxMaxBufferLength: 20,
-    });
-    hls.loadSource(url);
-    hls.attachMedia(v);
-    hls.on(Hls.Events.MANIFEST_PARSED, () => v.play().catch(()=>{}));
-    hls.on(Hls.Events.ERROR, (e, d) => {
-      if (d.fatal) setTimeout(() => { hls.stopLoad(); hls.loadSource(url); }, 2000);
-    });
-  } else {
-    v.src = url; v.load(); v.play().catch(()=>{});
-  }
 }
 [1,2,3,4].forEach(createPlayer);
 async function poll() {
@@ -604,7 +576,7 @@ poll();
 
 
 async def http_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    """Minimal HTTP/1.0 server — HLS files + status + player."""
+    """HTTP server — player, status API, and WebSocket upgrade for live video."""
     try:
         try:
             request_line = (await asyncio.wait_for(reader.readline(), timeout=10)).decode(errors="replace").strip()
@@ -613,7 +585,8 @@ async def http_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         if not request_line:
             return
 
-        # Drain headers
+        # Drain headers, collecting Upgrade and WebSocket key
+        headers = {}
         while True:
             try:
                 line = await asyncio.wait_for(reader.readline(), timeout=5)
@@ -621,11 +594,46 @@ async def http_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                 break
             if line in (b"\r\n", b"\n", b""):
                 break
+            if b":" in line:
+                k, _, v = line.decode(errors="replace").partition(":")
+                headers[k.strip().lower()] = v.strip()
 
         parts = request_line.split(" ")
         if len(parts) < 2:
             return
         path = parts[1].split("?")[0]
+
+        # MJPEG live stream — one HTTP connection per channel, frames pushed in real-time
+        if path.startswith("/mjpeg/"):
+            try:
+                ch = int(path.split("/")[-1].split("?")[0])
+            except (ValueError, IndexError):
+                writer.close()
+                return
+            # Send MJPEG headers
+            writer.write(
+                b"HTTP/1.0 200 OK\r\n"
+                b"Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+                b"Cache-Control: no-cache, no-store\r\n"
+                b"Access-Control-Allow-Origin: *\r\n"
+                b"\r\n"
+            )
+            await writer.drain()
+            stream_mgr.add_mjpeg_client(ch, writer)
+            try:
+                # Keep connection alive — client disconnects by closing browser/tab
+                while True:
+                    await asyncio.sleep(30)
+                    # Send a keepalive comment (MJPEG doesn't need explicit keepalive, but doesn't hurt)
+            except Exception:
+                pass
+            finally:
+                stream_mgr.remove_mjpeg_client(ch, writer)
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+            return
 
         static_dir = Path(__file__).parent / "static"
 
@@ -645,31 +653,9 @@ async def http_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         elif path == "/status":
             payload = json.dumps({
                 "devices": devices,
-                "streams": stream_mgr.status(),
+                "streams": stream_mgr.status,
             }, indent=2, default=str).encode()
             respond("200 OK", "application/json", payload)
-
-        elif path == "/hls/1/master.m3u8":
-            # Master playlist declaring HEVC codec for hls.js compatibility
-            body = (
-                "#EXTM3U\n"
-                "#EXT-X-VERSION:6\n"
-                '#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS="hvc1.1.6.L93.90",RESOLUTION=1280x720\n'
-                "index.m3u8\n"
-            ).encode()
-            respond("200 OK", "application/vnd.apple.mpegurl", body)
-
-        elif path.startswith("/hls/"):
-            fpath = static_dir / "hls" / path[5:]
-            if fpath.exists() and fpath.is_file():
-                p = str(fpath)
-                if p.endswith(".m3u8"):   ct = "application/vnd.apple.mpegurl"
-                elif p.endswith(".m4s"):  ct = "video/iso.segment"
-                elif p.endswith(".mp4"):  ct = "video/mp4"
-                else:                     ct = "video/mp2t"
-                respond("200 OK", ct, fpath.read_bytes())
-            else:
-                respond("404 Not Found", "text/plain", b"Not found")
 
         else:
             respond("404 Not Found", "text/plain", b"Not found")
