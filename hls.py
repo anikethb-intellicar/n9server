@@ -17,7 +17,7 @@ from pathlib import Path
 log = logging.getLogger("hls")
 
 # HLS output lives under ./static/hls/<channel>/
-HLS_BASE = Path(__file__).parent.parent / "static" / "hls"
+HLS_BASE = Path(__file__).parent / "static" / "hls"
 
 # ffmpeg command template.
 # -f h264           : input is raw Annex-B H.264
@@ -27,37 +27,55 @@ HLS_BASE = Path(__file__).parent.parent / "static" / "hls"
 # -hls_list_size    : number of segments to keep in the playlist
 # -hls_flags        : delete_segments = remove old files automatically
 # -start_number     : start segment numbering from 0
-FFMPEG_CMD = [
-    "ffmpeg",
-    "-loglevel", "warning",
-    "-f", "h264",
-    "-i", "pipe:0",
-    "-c:v", "copy",
-    "-f", "hls",
-    "-hls_time", "2",
-    "-hls_list_size", "5",
-    "-hls_flags", "delete_segments+append_list",
-    "-hls_segment_filename", "",  # filled in per-channel
-    "",                           # playlist path — filled in per-channel
-]
+def _ffmpeg_cmd(codec: str = "h264") -> list:
+    """Build FFmpeg command for the given input codec (h264 or hevc)."""
+    fmt = "hevc" if codec in ("H265", "hevc", "h265") else "h264"
+    return [
+        "ffmpeg",
+        "-loglevel", "warning",
+        "-fflags", "+genpts+discardcorrupt",
+        "-r", "25",
+        "-f", fmt,
+        "-i", "pipe:0",
+        "-c:v", "libx264",         # transcode to H264 for browser compatibility
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-crf", "23",
+        "-g", "50",
+        "-f", "hls",
+        "-hls_time", "2",
+        "-hls_list_size", "6",
+        "-hls_flags", "delete_segments",
+        "-hls_segment_filename", "",  # filled in per-channel
+        "",                           # playlist path — filled in per-channel
+    ]
 
 
 class FFmpegStreamer:
     """
-    Wraps an ffmpeg subprocess.  Feed raw H.264 Annex-B frames via write().
+    Wraps an ffmpeg subprocess.  Feed raw Annex-B frames via write().
     HLS output lands in static/hls/<channel>/index.m3u8.
     """
 
-    def __init__(self, channel: int):
-        self.channel   = channel
-        self._proc     = None
-        self._out_dir  = HLS_BASE / str(channel)
-        self._playlist = self._out_dir / "index.m3u8"
-        self._seg_pat  = str(self._out_dir / "seg%05d.ts")
-        self._lock     = asyncio.Lock()
-        self._started  = False
-        self._frames   = 0
+    _VPS_PREFIX   = b'\x00\x00\x00\x01\x40'   # H265 VPS NAL
+    _START_CODE   = b'\x00\x00\x00\x01'
+    # RASL NAL types cause gray frames — they reference pre-keyframe frames
+    # RASL_R=type8 (hdr=0x10), RASL_N=type9 (hdr=0x12)
+    _RASL_HDRS    = {0x10, 0x12}
+
+    def __init__(self, channel: int, codec: str = "h264"):
+        self.channel    = channel
+        self._codec     = codec
+        self._proc      = None
+        self._out_dir   = HLS_BASE / str(channel)
+        self._playlist  = self._out_dir / "index.m3u8"
+        self._seg_pat   = str(self._out_dir / "seg%05d.ts")
+        self._lock      = asyncio.Lock()
+        self._started   = False
+        self._frames    = 0
         self._last_frame_ts = 0.0
+        self._pre_buf   = bytearray()   # buffer until first keyframe
+        self._got_keyframe = False
 
     @property
     def playlist_path(self) -> Path:
@@ -73,7 +91,7 @@ class FFmpegStreamer:
             return
         self._out_dir.mkdir(parents=True, exist_ok=True)
 
-        cmd = list(FFMPEG_CMD)
+        cmd = _ffmpeg_cmd(self._codec)
         cmd[-2] = self._seg_pat
         cmd[-1] = str(self._playlist)
 
@@ -95,28 +113,62 @@ class FFmpegStreamer:
             if txt:
                 log.warning("[ffmpeg ch%d] %s", self.channel, txt)
 
+    def _strip_rasl(self, data: bytes) -> bytes:
+        """Remove H265 RASL NAL units from Annex-B stream to eliminate gray frames."""
+        result = bytearray()
+        pos = 0
+        while pos < len(data):
+            idx = data.find(self._START_CODE, pos)
+            if idx == -1:
+                result.extend(data[pos:])
+                break
+            result.extend(data[pos:idx])
+            next_idx = data.find(self._START_CODE, idx + 4)
+            nal_end = next_idx if next_idx != -1 else len(data)
+            # Check NAL type header byte (5th byte = first byte of NAL header)
+            if idx + 4 < len(data) and data[idx + 4] in self._RASL_HDRS:
+                pos = nal_end  # skip RASL NAL unit
+                continue
+            result.extend(data[idx:nal_end])
+            pos = nal_end
+        return bytes(result)
+
     async def write(self, frame: bytes):
-        """
-        Write one complete H.264 Annex-B frame to ffmpeg stdin.
-        Automatically starts ffmpeg on first call.
-        """
+        """Feed payload bytes to ffmpeg, waiting for IDR before starting."""
+        self._frames += 1
+        self._last_frame_ts = time.time()
+
+        if not self._got_keyframe:
+            self._pre_buf.extend(frame)
+            buf = bytes(self._pre_buf)
+            vps_idx = buf.find(self._VPS_PREFIX)
+            if vps_idx == -1:
+                if len(self._pre_buf) > 100_000:
+                    self._pre_buf.clear()
+                return
+            frame = buf[vps_idx:]
+            self._pre_buf.clear()
+            self._got_keyframe = True
+            log.info("VPS found for ch%d at buf[%d] — starting FFmpeg", self.channel, vps_idx)
+            await self.start()
+
         if not self._started:
             await self.start()
 
         if self._proc is None or self._proc.returncode is not None:
-            log.warning("FFmpeg ch%d is dead, restarting", self.channel)
+            log.warning("FFmpeg ch%d is dead, restarting on next keyframe", self.channel)
             self._started = False
-            await self.start()
+            self._got_keyframe = False
+            return
 
         try:
             async with self._lock:
                 self._proc.stdin.write(frame)
                 await self._proc.stdin.drain()
-            self._frames += 1
-            self._last_frame_ts = time.time()
         except (BrokenPipeError, ConnectionResetError):
             log.warning("FFmpeg ch%d stdin broken", self.channel)
             self._started = False
+            self._got_keyframe = False
 
     async def stop(self):
         if self._proc and self._proc.returncode is None:
@@ -138,13 +190,20 @@ class StreamManager:
     def __init__(self):
         self._streamers: dict[int, FFmpegStreamer] = {}
 
-    def get(self, channel: int) -> FFmpegStreamer:
+    def get(self, channel: int, codec: str = "h264") -> FFmpegStreamer:
         if channel not in self._streamers:
-            self._streamers[channel] = FFmpegStreamer(channel)
+            self._streamers[channel] = FFmpegStreamer(channel, codec=codec)
         return self._streamers[channel]
 
-    async def write_frame(self, channel: int, frame: bytes):
-        await self.get(channel).write(frame)
+    async def write_frame(self, channel: int, frame: bytes, codec: str = "h264"):
+        await self.get(channel, codec=codec).write(frame)
+
+    async def reset(self, channel: int):
+        """Stop and discard the existing streamer for this channel (fresh JT1078 connection)."""
+        if channel in self._streamers:
+            log.info("Resetting streamer for channel %d (new JT1078 connection)", channel)
+            await self._streamers[channel].stop()
+            del self._streamers[channel]
 
     def hls_url(self, channel: int, host: str = "localhost", port: int = 8080) -> str:
         return f"http://{host}:{port}/hls/{channel}/index.m3u8"

@@ -41,6 +41,8 @@ MSG_REGISTER_RESP   = 0x8100
 MSG_GENERAL_RESP    = 0x8001
 MSG_AV_REQ          = 0x9101
 MSG_AV_CLOSE        = 0x9102
+MSG_QUERY_ALL_PARAMS = 0x8104
+MSG_PARAMS_RESP      = 0x0104   # device → server: query all params response
 
 FRAME_MARKER = 0x7E
 
@@ -60,10 +62,11 @@ RESULT_ALARM_CONFIRM = 0x04
 class JT808Header:
     msg_id:      int
     body_props:  int
-    phone:       str    # hex string e.g. "088556000002"
+    phone:       str    # hex string — 12 chars (2013) or 20 chars (2019)
     serial:      int
     pkg_total:   int = 0
     pkg_index:   int = 0
+    is_2019:     bool = False   # True when body_props bit 14 is set
 
     @property
     def has_subpkg(self) -> bool:
@@ -174,35 +177,59 @@ def parse_frame(raw: bytes) -> Optional[JT808Message]:
     payload    = inner[:-1]
     msg_id     = struct.unpack_from(">H", payload, 0)[0]
     body_props = struct.unpack_from(">H", payload, 2)[0]
-    phone      = payload[4:10].hex()
-    serial     = struct.unpack_from(">H", payload, 10)[0]
+
+    # JT808-2019: body_props bit 14 set → 10-byte phone + 1-byte version (17-byte header)
+    # JT808-2013: 6-byte phone (12-byte header)
+    is_2019 = bool(body_props & 0x4000)
+    if is_2019:
+        if len(payload) < 17:
+            return None
+        phone      = payload[4:14].hex()
+        serial     = struct.unpack_from(">H", payload, 15)[0]
+        body_start = 17
+    else:
+        if len(payload) < 12:
+            return None
+        phone      = payload[4:10].hex()
+        serial     = struct.unpack_from(">H", payload, 10)[0]
+        body_start = 12
 
     has_sub = bool(body_props & (1 << 13))
     if has_sub:
-        if len(payload) < 16:
+        if len(payload) < body_start + 4:
             return None
-        pkg_total = struct.unpack_from(">H", payload, 12)[0]
-        pkg_index = struct.unpack_from(">H", payload, 14)[0]
-        body = payload[16:]
+        pkg_total = struct.unpack_from(">H", payload, body_start)[0]
+        pkg_index = struct.unpack_from(">H", payload, body_start + 2)[0]
+        body = payload[body_start + 4:]
     else:
         pkg_total = pkg_index = 0
-        body = payload[12:]
+        body = payload[body_start:]
 
     header = JT808Header(
         msg_id=msg_id, body_props=body_props, phone=phone,
         serial=serial, pkg_total=pkg_total, pkg_index=pkg_index,
+        is_2019=is_2019,
     )
     return JT808Message(header=header, body=body)
 
 
-def build_frame(msg_id: int, phone_hex: str, serial: int, body: bytes) -> bytes:
-    """Build a server→device JT808 frame."""
-    phone_bytes = bytes.fromhex(phone_hex.zfill(12))
-    body_props  = len(body) & 0x03FF
-    header      = struct.pack(">HH", msg_id, body_props) + phone_bytes + struct.pack(">H", serial)
-    payload     = header + body
-    cs          = checksum(payload)
-    full        = payload + bytes([cs])
+def build_frame(msg_id: int, phone_hex: str, serial: int, body: bytes,
+                is_2019: bool = False) -> bytes:
+    """Build a server→device JT808 frame, mirroring the device's protocol version."""
+    if is_2019:
+        phone_bytes = bytes.fromhex(phone_hex.zfill(20))
+        body_props  = (len(body) & 0x03FF) | 0x4000
+        header      = (struct.pack(">HH", msg_id, body_props)
+                       + phone_bytes
+                       + b'\x02'               # version byte — match camera's version
+                       + struct.pack(">H", serial))
+    else:
+        phone_bytes = bytes.fromhex(phone_hex.zfill(12))
+        body_props  = len(body) & 0x03FF
+        header      = struct.pack(">HH", msg_id, body_props) + phone_bytes + struct.pack(">H", serial)
+    payload = header + body
+    cs      = checksum(payload)
+    full    = payload + bytes([cs])
     return bytes([FRAME_MARKER]) + escape(full) + bytes([FRAME_MARKER])
 
 
@@ -211,46 +238,56 @@ def build_frame(msg_id: int, phone_hex: str, serial: int, body: bytes) -> bytes:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_general_resp(phone: str, resp_serial: int, resp_msg_id: int,
-                       result: int = RESULT_SUCCESS, serial: int = 0) -> bytes:
+                       result: int = RESULT_SUCCESS, serial: int = 0,
+                       is_2019: bool = False) -> bytes:
     """0x8001 General response."""
     body = struct.pack(">HHB", resp_serial, resp_msg_id, result)
-    return build_frame(MSG_GENERAL_RESP, phone, serial, body)
+    return build_frame(MSG_GENERAL_RESP, phone, serial, body, is_2019=is_2019)
 
 
 def build_register_resp(phone: str, serial: int,
                         result: int = RESULT_SUCCESS,
-                        auth_code: str = "") -> bytes:
-    """
-    0x8100 Registration response.
-    Pass auth_code="" to have one generated dynamically (recommended).
-    """
+                        auth_code: str = "",
+                        is_2019: bool = False) -> bytes:
+    """0x8100 Registration response."""
     auth_bytes = auth_code.encode("ascii")
     body = struct.pack(">HB", serial, result) + auth_bytes
-    return build_frame(MSG_REGISTER_RESP, phone, 0, body)
+    return build_frame(MSG_REGISTER_RESP, phone, 0, body, is_2019=is_2019)
+
+
+def build_query_all_params(phone: str, serial: int, is_2019: bool = False) -> bytes:
+    """0x8104 Query all parameters — body is empty."""
+    return build_frame(MSG_QUERY_ALL_PARAMS, phone, serial, b'', is_2019=is_2019)
 
 
 def build_av_request(phone: str, serial: int, channel: int = 1,
-                     av_type: int = 1, stream_type: int = 0,
+                     av_type: int = 0, stream_type: int = 0,
                      server_ip: str = "0.0.0.0", tcp_port: int = 0,
-                     udp_port: int = 0) -> bytes:
-    """0x9101 Real-time AV stream request."""
-    ip_bytes = server_ip.encode("ascii").ljust(31, b'\x00')[:31]
+                     udp_port: int = 0, is_2019: bool = False) -> bytes:
+    """0x9101 Real-time AV stream request.
+    Format: [ip_len(1)] [ip(ip_len)] [tcp_port(2)] [udp_port(2)] [channel(1)] [av_type(1)] [stream_type(1)]
+    """
+    ip_bytes = server_ip.encode("ascii")
     body = (
-        ip_bytes
+        bytes([len(ip_bytes)])
+        + ip_bytes
         + struct.pack(">H", tcp_port)
         + struct.pack(">H", udp_port)
         + struct.pack("B", channel)
         + struct.pack("B", av_type)
         + struct.pack("B", stream_type)
     )
-    return build_frame(MSG_AV_REQ, phone, serial, body)
+    return build_frame(MSG_AV_REQ, phone, serial, body, is_2019=is_2019)
 
 
 def build_av_close(phone: str, serial: int, channel: int = 1,
-                   close_type: int = 0) -> bytes:
-    """0x9102 Close AV stream."""
-    body = struct.pack("BB", channel, close_type)
-    return build_frame(MSG_AV_CLOSE, phone, serial, body)
+                   close_type: int = 0, is_2019: bool = False) -> bytes:
+    """0x9102 AV stream control.
+    Format: [channel(1)] [control(1)] [av_type(1)] [stream_type(1)]
+    control: 0=close, 1=pause, 2=resume, 3=switch
+    """
+    body = struct.pack("BBBB", channel, close_type, 0, 0)
+    return build_frame(MSG_AV_CLOSE, phone, serial, body, is_2019=is_2019)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -1,3 +1,4 @@
+
 """
 N9 Dashcam Server — main.py
 ============================
@@ -22,6 +23,7 @@ import asyncio
 import json
 import logging
 import argparse
+import struct
 import time
 import socket
 from pathlib import Path
@@ -29,12 +31,14 @@ from pathlib import Path
 from jt808 import (
     parse_frame,
     build_general_resp, build_register_resp, build_av_request, build_av_close,
+    build_query_all_params,
     parse_register_info, parse_location, parse_batch_location,
     AuthCodeStore,
     MSG_REGISTER, MSG_AUTH, MSG_HEARTBEAT, MSG_LOCATION,
     MSG_LOCATION_BATCH, MSG_TERMINAL_LOGOUT,
     MSG_MEDIA_INFO, MSG_MEDIA_UPLOAD,
     MSG_REGISTER_RESP, MSG_GENERAL_RESP,
+    MSG_QUERY_ALL_PARAMS, MSG_PARAMS_RESP,
     FRAME_MARKER,
     RESULT_SUCCESS, RESULT_FAILURE, RESULT_NOT_SUPPORTED, RESULT_MESSAGE_ERROR,
 )
@@ -49,7 +53,7 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 # ── Timeouts (seconds) ───────────────────────────────────────────────────────
-READ_TIMEOUT  = 60    # how long to wait for next data from device
+READ_TIMEOUT  = 300   # how long to wait for next data from device
 WRITE_TIMEOUT = 10    # how long a send is allowed to take
 
 # ── Shared state ─────────────────────────────────────────────────────────────
@@ -58,6 +62,13 @@ auth_store  = AuthCodeStore()
 
 # phone -> {phone, registered, authed, last_seen, location, peer, reg_info}
 devices: dict[str, dict] = {}
+
+# Active authenticated JT808 connections (for cross-component signaling)
+active_jt808: dict[str, object] = {}
+
+# JT1078 channel assignment: each new connection gets the next available channel (1-4)
+_jt1078_channel_counter = 0
+_NUM_CAMERAS = 4
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -74,6 +85,8 @@ class JT808Connection:
         self.phone: str | None = None
         self._serial     = 0
         self._buf        = bytearray()
+        self._is_2019    = False   # set on first message from device
+        self._heartbeat_count = 0
         addr             = writer.get_extra_info("peername")
         self.peer        = f"{addr[0]}:{addr[1]}" if addr else "?"
 
@@ -126,6 +139,7 @@ class JT808Connection:
                 dev["online"] = False
                 dev["authed"] = False
                 auth_store.revoke(self.phone)
+                active_jt808.pop(self.phone, None)
 
     async def _process_buf(self):
         while True:
@@ -153,6 +167,7 @@ class JT808Connection:
         hdr = msg.header
         mid = hdr.msg_id
 
+        self._is_2019 = hdr.is_2019
         log.debug("MSG 0x%04X from %s serial=%d body=%d bytes",
                   mid, hdr.phone, hdr.serial, len(msg.body))
 
@@ -170,11 +185,17 @@ class JT808Connection:
             await self._on_logout(hdr)
         elif mid in (MSG_MEDIA_INFO, MSG_MEDIA_UPLOAD):
             await self._on_media(hdr, mid)
+        elif mid == 0x0001:
+            # Terminal general response — acknowledgment of our commands, no reply needed
+            log.debug("Terminal ACK 0x0001 from %s serial=%d", hdr.phone, hdr.serial)
+        elif mid == MSG_PARAMS_RESP:
+            self._on_params_resp(msg.body)
         else:
             log.debug("Unsupported msg 0x%04X from %s", mid, hdr.phone)
             resp = build_general_resp(hdr.phone, hdr.serial, mid,
                                       result=RESULT_NOT_SUPPORTED,
-                                      serial=self._next_serial())
+                                      serial=self._next_serial(),
+                                      is_2019=self._is_2019)
             await self._send(resp)
 
     # ── Handlers ─────────────────────────────────────────────────────────────
@@ -211,12 +232,19 @@ class JT808Connection:
 
         resp = build_register_resp(self.phone, hdr.serial,
                                    result=RESULT_SUCCESS,
-                                   auth_code=auth_code)
+                                   auth_code=auth_code,
+                                   is_2019=self._is_2019)
         await self._send(resp)
 
     async def _on_auth(self, hdr, body: bytes):
-        self.phone     = hdr.phone
-        presented_code = body.decode("ascii", errors="replace")
+        self.phone = hdr.phone
+        # JT808-2019 auth body: [1-byte len] [auth_code] [device_info...]
+        # JT808-2013 auth body: just the auth code bytes
+        if hdr.is_2019 and len(body) > 0:
+            auth_len = body[0]
+            presented_code = body[1:1 + auth_len].decode("ascii", errors="replace")
+        else:
+            presented_code = body.decode("ascii", errors="replace")
 
         log.info("AUTH %s | code=%r", self.phone, presented_code)
 
@@ -232,6 +260,7 @@ class JT808Connection:
             devices[self.phone]["authed"]    = True
             devices[self.phone]["online"]    = True
             devices[self.phone]["last_seen"] = time.time()
+            active_jt808[self.phone]        = self  # register for JT1078 signaling
             log.info("Terminal %s authenticated successfully", self.phone)
         else:
             result = RESULT_FAILURE
@@ -239,13 +268,20 @@ class JT808Connection:
 
         resp = build_general_resp(self.phone, hdr.serial, MSG_AUTH,
                                   result=result,
-                                  serial=self._next_serial())
+                                  serial=self._next_serial(),
+                                  is_2019=self._is_2019)
         await self._send(resp)
 
-        # Only request video if auth succeeded
         if result == RESULT_SUCCESS:
-            await asyncio.sleep(0.5)
-            await self._request_stream(channel=1)
+            await asyncio.sleep(2)
+            # Query all device parameters
+            qry = build_query_all_params(self.phone, self._next_serial(), is_2019=self._is_2019)
+            await self._send(qry)
+            await asyncio.sleep(2)
+            # Request all 4 camera channels
+            for ch in range(1, _NUM_CAMERAS + 1):
+                await self._request_stream(channel=ch)
+                await asyncio.sleep(0.5)
 
     async def _on_heartbeat(self, hdr):
         self.phone = hdr.phone
@@ -255,7 +291,8 @@ class JT808Connection:
             log.warning("Heartbeat from unauthenticated terminal %s — rejecting", self.phone)
             resp = build_general_resp(self.phone, hdr.serial, MSG_HEARTBEAT,
                                       result=RESULT_FAILURE,
-                                      serial=self._next_serial())
+                                      serial=self._next_serial(),
+                                      is_2019=self._is_2019)
             await self._send(resp)
             return
 
@@ -266,8 +303,18 @@ class JT808Connection:
         log.debug("HEARTBEAT %s", self.phone)
         resp = build_general_resp(self.phone, hdr.serial, MSG_HEARTBEAT,
                                   result=RESULT_SUCCESS,
-                                  serial=self._next_serial())
+                                  serial=self._next_serial(),
+                                  is_2019=self._is_2019)
         await self._send(resp)
+
+        # Periodic re-request for all 4 channels every ~5 min
+        self._heartbeat_count += 1
+        if self._heartbeat_count % 50 == 0:
+            async def refresh_all():
+                for ch in range(1, _NUM_CAMERAS + 1):
+                    await self._request_stream(channel=ch)
+                    await asyncio.sleep(0.5)
+            asyncio.ensure_future(refresh_all())
 
     async def _on_location(self, hdr, body: bytes):
         self.phone = hdr.phone
@@ -277,7 +324,8 @@ class JT808Connection:
             log.warning("Location from unauthenticated terminal %s — rejecting", self.phone)
             resp = build_general_resp(self.phone, hdr.serial, MSG_LOCATION,
                                       result=RESULT_FAILURE,
-                                      serial=self._next_serial())
+                                      serial=self._next_serial(),
+                                      is_2019=self._is_2019)
             await self._send(resp)
             return
 
@@ -304,7 +352,8 @@ class JT808Connection:
 
         resp = build_general_resp(self.phone, hdr.serial, MSG_LOCATION,
                                   result=RESULT_SUCCESS,
-                                  serial=self._next_serial())
+                                  serial=self._next_serial(),
+                                  is_2019=self._is_2019)
         await self._send(resp)
 
     async def _on_location_batch(self, hdr, body: bytes):
@@ -315,7 +364,8 @@ class JT808Connection:
             log.warning("Batch location from unauthenticated %s — rejecting", self.phone)
             resp = build_general_resp(self.phone, hdr.serial, MSG_LOCATION_BATCH,
                                       result=RESULT_FAILURE,
-                                      serial=self._next_serial())
+                                      serial=self._next_serial(),
+                                      is_2019=self._is_2019)
             await self._send(resp)
             return
 
@@ -329,7 +379,8 @@ class JT808Connection:
 
         resp = build_general_resp(self.phone, hdr.serial, MSG_LOCATION_BATCH,
                                   result=RESULT_SUCCESS,
-                                  serial=self._next_serial())
+                                  serial=self._next_serial(),
+                                  is_2019=self._is_2019)
         await self._send(resp)
 
     async def _on_logout(self, hdr):
@@ -345,29 +396,66 @@ class JT808Connection:
 
         resp = build_general_resp(self.phone, hdr.serial, MSG_TERMINAL_LOGOUT,
                                   result=RESULT_SUCCESS,
-                                  serial=self._next_serial())
+                                  serial=self._next_serial(),
+                                  is_2019=self._is_2019)
         await self._send(resp)
+
+    def _on_params_resp(self, body: bytes):
+        """Parse 0x0104 — all device parameters response.
+        Format: resp_serial(2) | count(1) | [param_id(4) | len(1) | value(len)] * count
+        """
+        if len(body) < 3:
+            log.info("PARAMS 0x0104 — body too short (%d bytes): %s", len(body), body.hex())
+            return
+        resp_serial = struct.unpack_from(">H", body, 0)[0]
+        count = body[2]
+        offset = 3
+        log.info("PARAMS 0x0104 — resp_serial=%d count=%d raw=%s", resp_serial, count, body.hex())
+        for _ in range(count):
+            if offset + 5 > len(body):
+                break
+            param_id  = struct.unpack_from(">I", body, offset)[0]
+            param_len = body[offset + 4]
+            offset += 5
+            if offset + param_len > len(body):
+                break
+            value = body[offset:offset + param_len]
+            offset += param_len
+            try:
+                val_str = value.decode("ascii", errors="replace").rstrip("\x00")
+            except Exception:
+                val_str = value.hex()
+            log.info("  param 0x%08X len=%d: %r  hex=%s", param_id, param_len, val_str, value.hex())
 
     async def _on_media(self, hdr, mid: int):
         log.info("MEDIA msg 0x%04X from %s", mid, hdr.phone)
         resp = build_general_resp(hdr.phone, hdr.serial, mid,
                                   result=RESULT_SUCCESS,
-                                  serial=self._next_serial())
+                                  serial=self._next_serial(),
+                                  is_2019=self._is_2019)
         await self._send(resp)
 
     async def _request_stream(self, channel: int = 1):
-        """Send 0x9101 — tell device to push video to our JT1078 port."""
+        """Send 0x9102 close then 0x9101 open — ensures single JT1078 connection."""
+        close_cmd = build_av_close(
+            phone=self.phone, serial=self._next_serial(),
+            channel=channel, close_type=0, is_2019=self._is_2019,
+        )
+        await self._send(close_cmd)
+        await asyncio.sleep(0.5)
+
         log.info("Requesting AV stream ch%d from %s → %s:%d",
                  channel, self.phone, self.server_ip, self.jt1078_port)
         cmd = build_av_request(
             phone=self.phone,
             serial=self._next_serial(),
             channel=channel,
-            av_type=1,               # video only (0 = audio+video)
+            av_type=0,               # 0=audio+video, 1=video only
             stream_type=0,            # main stream
             server_ip=self.server_ip,
             tcp_port=self.jt1078_port,
             udp_port=0,
+            is_2019=self._is_2019,
         )
         await self._send(cmd)
 
@@ -391,7 +479,12 @@ class JT1078Connection:
         return self._assemblers[ch]
 
     async def run(self):
-        log.info("JT1078 connect from %s", self.peer)
+        global _jt1078_channel_counter
+        # Assign this connection to the next camera channel (1-4, cycling)
+        _jt1078_channel_counter += 1
+        my_channel = ((_jt1078_channel_counter - 1) % _NUM_CAMERAS) + 1
+        log.info("JT1078 connect from %s → assigned to channel %d", self.peer, my_channel)
+        await stream_mgr.reset(my_channel)
         try:
             while True:
                 try:
@@ -408,21 +501,30 @@ class JT1078Connection:
 
                 self._buf.feed(data)
                 for pkt in self._buf.packets():
-                    await self._handle_packet(pkt)
+                    await self._handle_packet(pkt, my_channel)
 
         except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
             pass
         finally:
-            log.info("JT1078 disconnect: %s", self.peer)
+            log.info("JT1078 disconnect: ch%d %s", my_channel, self.peer)
+            # Re-request the stream for this channel
+            await asyncio.sleep(1)
+            for conn in list(active_jt808.values()):
+                if conn._is_authed():
+                    log.info("JT1078 ch%d ended — re-requesting", my_channel)
+                    asyncio.ensure_future(conn._request_stream(channel=my_channel))
+                    break
 
-    async def _handle_packet(self, pkt):
-        if not pkt.is_video:
+    async def _handle_packet(self, pkt, channel: int = 1):
+        if not pkt.payload:
             return
-        frame = self._assembler(pkt.channel).feed(pkt)
-        if frame:
-            if not frame.startswith(b'\x00\x00\x00\x01'):
-                frame = b'\x00\x00\x00\x01' + frame
-            await stream_mgr.write_frame(pkt.channel, frame)
+        # Accept any packet with a video codec (H264/H265) regardless of data_type field
+        # The camera sometimes marks video packets with non-standard data_type values
+        if pkt.codec not in ('H264', 'H265', 'PT98', 'PT99'):
+            # Only skip obvious non-video like audio codecs
+            if pkt.is_audio:
+                return
+        await stream_mgr.write_frame(channel, pkt.payload, codec=pkt.codec)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -464,11 +566,23 @@ function createPlayer(ch) {
   const url = `${BASE}/hls/${ch}/index.m3u8`;
   const v = document.getElementById(`v${ch}`);
   if (Hls.isSupported()) {
-    const hls = new Hls({ lowLatencyMode: true });
-    hls.loadSource(url); hls.attachMedia(v);
-    hls.on(Hls.Events.MANIFEST_PARSED, () => v.play());
-    hls.on(Hls.Events.ERROR, (e, d) => { if (d.fatal) setTimeout(() => hls.loadSource(url), 3000); });
-  } else if (v.canPlayType('application/vnd.apple.mpegurl')) { v.src = url; }
+    const hls = new Hls({
+      lowLatencyMode: true,
+      liveSyncDurationCount: 2,       // stay 2 segments behind live edge
+      liveMaxLatencyDurationCount: 5, // allow up to 5 segments behind before seeking
+      startPosition: -1,              // start at live edge, not beginning
+      maxBufferLength: 10,
+      maxMaxBufferLength: 20,
+    });
+    hls.loadSource(url);
+    hls.attachMedia(v);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => v.play().catch(()=>{}));
+    hls.on(Hls.Events.ERROR, (e, d) => {
+      if (d.fatal) setTimeout(() => { hls.stopLoad(); hls.loadSource(url); }, 2000);
+    });
+  } else {
+    v.src = url; v.load(); v.play().catch(()=>{});
+  }
 }
 [1,2,3,4].forEach(createPlayer);
 async function poll() {
@@ -477,7 +591,7 @@ async function poll() {
     document.getElementById('status').textContent = JSON.stringify(d, null, 2);
     for (const [ch, info] of Object.entries(d.streams || {})) {
       const dot = document.getElementById('dot'+ch);
-      if (dot) dot.className = 'dot'+(info.live?' live':'');
+      if (dot) dot.className = 'dot' + (info.live ? ' live' : '');
     }
   } catch(e) {}
   setTimeout(poll, 3000);
@@ -535,11 +649,24 @@ async def http_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             }, indent=2, default=str).encode()
             respond("200 OK", "application/json", payload)
 
+        elif path == "/hls/1/master.m3u8":
+            # Master playlist declaring HEVC codec for hls.js compatibility
+            body = (
+                "#EXTM3U\n"
+                "#EXT-X-VERSION:6\n"
+                '#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS="hvc1.1.6.L93.90",RESOLUTION=1280x720\n'
+                "index.m3u8\n"
+            ).encode()
+            respond("200 OK", "application/vnd.apple.mpegurl", body)
+
         elif path.startswith("/hls/"):
             fpath = static_dir / "hls" / path[5:]
             if fpath.exists() and fpath.is_file():
-                ct = ("application/vnd.apple.mpegurl"
-                      if str(fpath).endswith(".m3u8") else "video/mp2t")
+                p = str(fpath)
+                if p.endswith(".m3u8"):   ct = "application/vnd.apple.mpegurl"
+                elif p.endswith(".m4s"):  ct = "video/iso.segment"
+                elif p.endswith(".mp4"):  ct = "video/mp4"
+                else:                     ct = "video/mp2t"
                 respond("200 OK", ct, fpath.read_bytes())
             else:
                 respond("404 Not Found", "text/plain", b"Not found")
@@ -582,8 +709,29 @@ async def main():
                 server_ip = "127.0.0.1"
         log.info("Auto-detected server IP: %s (override with --server-ip)", server_ip)
 
+    async def jt808_dispatcher(reader: asyncio.StreamReader,
+                               writer: asyncio.StreamWriter):
+        """
+        Combined JT808 + JT1078 handler on the same port.
+        Detects protocol by first 4 bytes: JT1078 magic vs JT808 0x7E.
+        """
+        from jt1078 import MAGIC as JT1078_MAGIC
+        try:
+            first4 = await asyncio.wait_for(reader.read(4), timeout=10)
+        except asyncio.TimeoutError:
+            writer.close()
+            return
+        if not first4:
+            writer.close()
+            return
+        reader.feed_data(first4)   # put the bytes back
+        if first4 == JT1078_MAGIC:
+            await JT1078Connection(reader, writer).run()
+        else:
+            await JT808Connection(reader, writer, server_ip, args.port_1078).run()
+
     jt808_srv = await asyncio.start_server(
-        lambda r, w: JT808Connection(r, w, server_ip, args.port_1078).run(),
+        jt808_dispatcher,
         host=args.host, port=args.port_808,
     )
     jt1078_srv = await asyncio.start_server(

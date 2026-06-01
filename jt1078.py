@@ -49,7 +49,7 @@ PAYLOAD_TYPE = {
     26:  "JPEG",
 }
 
-HEADER_SIZE = 36
+HEADER_SIZE = 30   # magic(4)+rtp(2)+seq(2)+ts(4)+ssrc(4)+sim(6)+channel(1)+dt(1)+ts_ext(4)+payload_len(2)
 
 
 @dataclass
@@ -111,11 +111,9 @@ def parse_packet(data: bytes) -> Optional[JT1078Packet]:
     data_type  = (dt_byte >> 4) & 0x0F
     pkt_type   = dt_byte & 0x0F
 
-    # JT1078 extension: 8-byte unix millisecond timestamp at offset 24
-    ts_ms = struct.unpack_from(">Q", data, 24)[0]
-
-    # last_iframe_dist = struct.unpack_from(">H", data, 32)[0]  # informational
-    payload_len = struct.unpack_from(">H", data, 34)[0]
+    # 4-byte timestamp extension at [24:28], payload_len at [28:30]
+    ts_ms = struct.unpack_from(">I", data, 24)[0]
+    payload_len = struct.unpack_from(">H", data, 28)[0]
 
     if len(data) < HEADER_SIZE + payload_len:
         log.debug("Packet truncated: have %d need %d", len(data), HEADER_SIZE + payload_len)
@@ -176,8 +174,9 @@ class FrameAssembler:
                 return frame
             return None
 
-        log.warning("Unknown packet type 0x%X", pt)
-        return None
+        # Unknown type — treat as complete frame (some firmware variants use non-standard values)
+        log.debug("Treating unknown pkt_type 0x%X as complete frame", pt)
+        return bytes(pkt.payload)
 
 
 class StreamBuffer:
@@ -198,7 +197,6 @@ class StreamBuffer:
             # Find magic
             idx = self._raw.find(MAGIC)
             if idx == -1:
-                # No magic found — keep last 3 bytes in case magic straddles chunks
                 self._raw = self._raw[-3:] if len(self._raw) >= 3 else self._raw
                 return
 
@@ -207,14 +205,28 @@ class StreamBuffer:
                 self._raw = self._raw[idx:]
 
             if len(self._raw) < HEADER_SIZE:
-                return  # wait for more data
+                return
 
-            # Peek at payload length to know full packet size
-            payload_len = struct.unpack_from(">H", self._raw, 34)[0]
+            # Validate: byte[4] must have RTP version=2 (upper 2 bits = 10)
+            # and byte[5] PT must be a known codec (98=H264, 99=H265, etc.)
+            b4 = self._raw[4]
+            b5 = self._raw[5]
+            pt = b5 & 0x7F
+            if (b4 >> 6) != 2 or pt not in PAYLOAD_TYPE:
+                # Spurious magic match inside H265 payload — skip this byte and search again
+                self._raw = self._raw[1:]
+                continue
+
+            # Peek at payload length (at offset 28 with HEADER_SIZE=30)
+            payload_len = struct.unpack_from(">H", self._raw, 28)[0]
+            if payload_len == 0 or payload_len > 65000:
+                # Implausible payload length — spurious match
+                self._raw = self._raw[1:]
+                continue
+
             total = HEADER_SIZE + payload_len
-
             if len(self._raw) < total:
-                return  # wait for more data
+                return
 
             raw_pkt = bytes(self._raw[:total])
             self._raw = self._raw[total:]
