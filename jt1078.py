@@ -1,23 +1,25 @@
 """
-JT/T 1078-2016 RTP-like packet parser.
+JT/T 1078-2016 video packet parser — Ultravision/N9 variant.
 
-The N9 sends video over a TCP connection to a port you specify in the 0x9101 command.
-Each packet is:
+Packet layout per manufacturer spec (Table 3.13.1), 30-byte header:
 
-  0x30 0x31 0x63 0x64  (4-byte magic)
-  V (4 bits) | P (1) | X (1) | CC (4 bits) | M (1) | PT (7 bits)
-  Sequence number  (16 bits, big-endian)
-  Timestamp        (32 bits, big-endian)  -- 90kHz clock
-  SSRC             (32 bits)
-  SIM              (6 bytes BCD)  -- device SIM / phone number
-  Channel          (1 byte)
-  Data type        (4 bits) | Packet type (4 bits)
-  Timestamp ext    (8 bytes, unix ms)  -- JT1078 extension
-  Last I-frame distance (16 bits)
-  Payload length   (16 bits)
-  Payload          (variable)
+  0x30 0x31 0x63 0x64   magic (4 bytes)
+  V(2)|P(1)|X(1)|CC(4)  RTP-like flags (1 byte)
+  M(1)|PT(7)            marker + payload type / codec (1 byte)
+  Sequence number       (2 bytes, big-endian)
+  SIM card number       (6 bytes BCD)   ← offset 8
+  Channel number        (1 byte)        ← offset 14
+  Data type(4)|Pkt type(4) (1 byte)     ← offset 15
+  Timestamp             (8 bytes, unix milliseconds, uint64)  ← offset 16
+  I-frame interval      (2 bytes, ms)   ← offset 24
+  Frame interval        (2 bytes, ms)   ← offset 26
+  Payload length        (2 bytes)       ← offset 28
+  Payload               (variable)      ← offset 30
 
-Total fixed header: 4 + 2 + 2 + 4 + 4 + 6 + 1 + 1 + 8 + 2 + 2 = 36 bytes
+Total header: 4+1+1+2+6+1+1+8+2+2+2 = 30 bytes
+
+NOTE: This layout has NO standard RTP 90kHz timestamp field and NO SSRC field.
+The manufacturer removed those and placed SIM directly at offset 8.
 """
 
 import struct
@@ -49,7 +51,7 @@ PAYLOAD_TYPE = {
     26:  "JPEG",
 }
 
-HEADER_SIZE = 30   # magic(4)+rtp(2)+seq(2)+ts(4)+ssrc(4)+sim(6)+channel(1)+dt(1)+ts_ext(4)+payload_len(2)
+HEADER_SIZE = 30   # magic(4)+rtp(2)+seq(2)+sim(6)+channel(1)+dt(1)+timestamp_ms(8)+iframe_int(2)+frame_int(2)+payload_len(2)
 
 
 @dataclass
@@ -96,24 +98,25 @@ def parse_packet(data: bytes) -> Optional[JT1078Packet]:
         log.debug("Bad magic: %s", data[:4].hex())
         return None
 
-    # Byte 4-5: V(4)|P(1)|X(1)|CC(4) | M(1)|PT(7)
+    # Byte 4: V(2)|P(1)|X(1)|CC(4)   Byte 5: M(1)|PT(7)
     b4, b5 = data[4], data[5]
     pt = b5 & 0x7F            # payload type (codec hint)
 
-    sequence   = struct.unpack_from(">H", data, 6)[0]
-    # timestamp  = struct.unpack_from(">I", data, 8)[0]   # 90kHz, unused
-    # ssrc       = struct.unpack_from(">I", data, 12)[0]
+    sequence  = struct.unpack_from(">H", data, 6)[0]   # serial number
 
-    sim_bytes  = data[16:22]
+    # Manufacturer layout: NO RTP 90kHz timestamp, NO SSRC.
+    # SIM starts directly at offset 8.
+    sim_bytes  = data[8:14]                             # SIM BCD[6]  @ offset 8
     sim        = sim_bytes.hex()
-    channel    = data[22]
-    dt_byte    = data[23]
+    channel    = data[14]                               # channel      @ offset 14
+    dt_byte    = data[15]                               # data/pkt type @ offset 15
     data_type  = (dt_byte >> 4) & 0x0F
     pkt_type   = dt_byte & 0x0F
 
-    # 4-byte timestamp extension at [24:28], payload_len at [28:30]
-    ts_ms = struct.unpack_from(">I", data, 24)[0]
-    payload_len = struct.unpack_from(">H", data, 28)[0]
+    ts_ms       = struct.unpack_from(">Q", data, 16)[0] # timestamp ms (uint64) @ offset 16
+    # iframe_interval = struct.unpack_from(">H", data, 24)[0]  # not used
+    # frame_interval  = struct.unpack_from(">H", data, 26)[0]  # not used
+    payload_len = struct.unpack_from(">H", data, 28)[0] # payload length @ offset 28
 
     if len(data) < HEADER_SIZE + payload_len:
         log.debug("Packet truncated: have %d need %d", len(data), HEADER_SIZE + payload_len)

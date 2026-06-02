@@ -78,9 +78,11 @@ active_jt808: dict[str, object] = {}
 # Legacy alias (used in JT1078Connection)
 stream_mgr = None  # replaced by per-device lookup
 
-# JT1078 channel assignment: each new connection gets the next available channel (1-4)
-_jt1078_channel_counter = 0
 _NUM_CAMERAS = 4
+
+# Active JT1078 owner per (phone, channel). When a new connection claims a channel it
+# evicts the previous one so only one source ever writes to a given LiveStreamer.
+_jt1078_owners: dict[tuple, object] = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -487,11 +489,7 @@ class JT1078Connection:
         return self._assemblers[ch]
 
     async def run(self):
-        global _jt1078_channel_counter
-        _jt1078_channel_counter += 1
-        my_channel = ((_jt1078_channel_counter - 1) % _NUM_CAMERAS) + 1
-
-        # Find which device (phone) this JT1078 connection belongs to
+        # Identify device by matching the camera's IP to a known JT808 peer
         cam_ip = self.peer.split(":")[0]
         my_phone = None
         for phone, info in devices.items():
@@ -500,8 +498,10 @@ class JT1078Connection:
                 break
 
         mgr = get_device_streams(my_phone) if my_phone else get_device_streams("unknown")
-        log.info("JT1078 connect from %s → device=%s ch%d", self.peer, my_phone, my_channel)
-        await mgr.soft_reset(my_channel)
+        log.info("JT1078 connect from %s → device=%s", self.peer, my_phone)
+
+        # Track which channels this connection carries so we can re-request on disconnect
+        channels_seen: set[int] = set()
         try:
             while True:
                 try:
@@ -518,18 +518,38 @@ class JT1078Connection:
 
                 self._buf.feed(data)
                 for pkt in self._buf.packets():
-                    await self._handle_packet(pkt, my_channel, mgr)
+                    ch = pkt.channel
+                    key = (my_phone or "unknown", ch)
+
+                    if ch not in channels_seen:
+                        # Claim ownership — evicts any previous connection for this channel
+                        channels_seen.add(ch)
+                        _jt1078_owners[key] = self
+                        log.info("JT1078 ch%d claimed by %s device=%s", ch, self.peer, my_phone)
+                        await mgr.soft_reset(ch)
+
+                    # Skip packets if a newer connection has evicted us for this channel
+                    if _jt1078_owners.get(key) is not self:
+                        continue
+
+                    await self._handle_packet(pkt, mgr)
 
         except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
             pass
         finally:
-            log.info("JT1078 disconnect: ch%d device=%s", my_channel, my_phone)
-            for conn in list(active_jt808.values()):
-                if conn._is_authed():
-                    asyncio.ensure_future(conn._request_stream(channel=my_channel))
-                    break
+            log.info("JT1078 disconnect: channels=%s device=%s", sorted(channels_seen), my_phone)
+            for ch in sorted(channels_seen):
+                key = (my_phone or "unknown", ch)
+                # Only release ownership if we still hold it
+                if _jt1078_owners.get(key) is self:
+                    del _jt1078_owners[key]
+                # Re-request the channel so the camera reconnects
+                for conn in list(active_jt808.values()):
+                    if conn._is_authed():
+                        asyncio.ensure_future(conn._request_stream(channel=ch))
+                        break
 
-    async def _handle_packet(self, pkt, channel: int = 1, mgr=None):
+    async def _handle_packet(self, pkt, mgr=None):
         if not pkt.payload:
             return
         if pkt.codec not in ('H264', 'H265', 'PT98', 'PT99'):
@@ -537,7 +557,8 @@ class JT1078Connection:
                 return
         if mgr is None:
             return
-        await mgr.write_frame(channel, pkt.payload, codec=pkt.codec)
+        # Use the channel number embedded in the packet — never guess or assign it
+        await mgr.write_frame(pkt.channel, pkt.payload, codec=pkt.codec)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
