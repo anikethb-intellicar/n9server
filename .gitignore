@@ -7,33 +7,35 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-.env
-.venv
+.venv/
 venv/
-
-# HLS output (generated at runtime)
-static/hls/
-
-# Node (for docx generation script only)
-node_modules/
-npm-debug.log*
-
-# OS
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# VS Code
-.vscode/
-
-# Keys / secrets
-*.pem
-*.ppk
-*.key
+env/
 
 # Logs
 *.log
+detections.log
 
-# Temp
-*.tmp
-*.bak
+# Models
+*.pt
+*.onnx
+*.engine
+
+# HLS segments and playlists
+static/hls/
+
+# mediamtx binary and archive
+mediamtx
+mediamtx_*.tar.gz
+
+# Docs / PDFs (large binary files)
+*.pdf
+*.docx
+
+# Node
+node_modules/
+package-lock.json
+
+# Misc
+.DS_Store
+*.swp
+*.swo
