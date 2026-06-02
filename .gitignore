@@ -39,3 +39,5 @@ package-lock.json
 .DS_Store
 *.swp
 *.swo
+
+live_feed_license_plate_detection.ipynb
